@@ -6,6 +6,7 @@ import re
 import json
 import random
 from typing import Optional
+from urllib.parse import urlparse
 
 @register("lanzoucloud", "Binbim", "蓝奏云文件解析插件", "1.0.0")
 class LanzouCloudPlugin(Star):
@@ -28,6 +29,175 @@ class LanzouCloudPlugin(Star):
         ip1id = random.choice(arr_1)
         return f"{ip1id}.{ip2id}.{ip3id}.{ip4id}"
 
+    def _get_domain_from_url(self, url: str) -> str:
+        """安全地从URL中提取域名"""
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc or 'www.lanzoup.com'
+        except Exception:
+            return 'www.lanzoup.com'
+    
+
+    
+    def _extract_file_info(self, soft_info):
+        """从页面内容中提取文件信息"""
+        file_info = {'name': '未知文件', 'size': '未知大小'}
+        
+        # 尝试多种正则表达式匹配文件名
+        name_patterns = [
+            r'style="font-size: 30px;text-align: center;padding: 56px 0px 20px 0px;">(.*?)</div>',
+            r'<div class="n_box_3fn".*?>(.*?)</div>',
+            r'var filename = \'(.*?)\';',
+            r'div class="b"><span>(.*?)</span></div>'
+        ]
+        
+        for pattern in name_patterns:
+            match = re.search(pattern, soft_info)
+            if match:
+                file_info['name'] = match.group(1)
+                break
+        
+        # 尝试匹配文件大小
+        size_patterns = [
+            r'<div class="n_filesize".*?>大小：(.*?)</div>',
+            r'<span class="p7">文件大小：</span>(.*?)<br>'
+        ]
+        
+        for pattern in size_patterns:
+            match = re.search(pattern, soft_info)
+            if match:
+                file_info['size'] = match.group(1)
+                break
+        
+        return file_info
+    
+    async def _handle_password_protected_link(self, soft_info, url, pwd, file_info):
+        """处理密码保护的链接"""
+        if not pwd:
+            raise Exception("请输入分享密码")
+        
+        # 提取必要参数
+        segment_match = re.findall(r"'sign':'(.*?)',", soft_info)
+        signs_match = re.findall(r"ajaxdata = '(.*?)'", soft_info)
+        ajaxm_match = re.findall(r"ajaxm\.php\?file=(\d+)", soft_info)
+        
+        if not segment_match or not ajaxm_match:
+            raise Exception("解析页面参数失败")
+        
+        post_data = {
+             "action": "downprocess",
+             "sign": segment_match[1] if len(segment_match) > 1 else segment_match[0],
+             "p": pwd,
+             "kd": 1
+         }
+        
+        # 使用原始域名构建ajax URL
+        base_domain = self._get_domain_from_url(url)
+        ajax_url = f"https://{base_domain}/ajaxm.php?file={ajaxm_match[0]}"
+        response = await self.mlooc_curl_post(post_data, ajax_url, url)
+        
+        try:
+            result = json.loads(response)
+            if 'inf' in result:
+                file_info['name'] = result['inf']
+        except json.JSONDecodeError:
+            pass
+        
+        return response
+    
+    async def _handle_public_link(self, soft_info, url, file_info):
+        """处理公开链接"""
+        iframe_patterns = [
+            r'\n<iframe.*?name="[\s\S]*?"\ssrc="\/(.*?)"',
+            r'<iframe.*?name="[\s\S]*?"\ssrc="\/(.*?)"',
+            r'<iframe.*?src="\/(.*?)"',
+            r'<iframe[^>]*src="([^"]*?)"',
+            r'src="\/(fn\?[^"]*?)"',
+            r'src="([^"]*fn\?[^"]*?)"'
+        ]
+        
+        link_match = None
+        for pattern in iframe_patterns:
+            link_match = re.search(pattern, soft_info)
+            if link_match:
+                break
+        
+        if not link_match:
+            # 如果是文件夹链接，尝试提取文件夹信息
+            if "文件夹" in soft_info or "folder" in url.lower() or "/b" in url:
+                raise Exception("检测到文件夹链接，请提供具体文件的分享链接")
+            else:
+                raise Exception("无法解析iframe链接，请检查链接是否正确")
+        
+        # 构建iframe URL，使用原始域名
+        iframe_path = link_match.group(1)
+        base_domain = self._get_domain_from_url(url)
+        
+        if iframe_path.startswith('http'):
+            ifurl = iframe_path
+        elif iframe_path.startswith('/'):
+            ifurl = f"https://{base_domain}{iframe_path}"
+        else:
+            ifurl = f"https://{base_domain}/{iframe_path}"
+        
+        iframe_content = await self.mlooc_curl_get(ifurl)
+        
+        # 提取参数
+        segment_match = re.findall(r"wp_sign = '(.*?)'", iframe_content)
+        signs_match = re.findall(r"ajaxdata = '(.*?)'", iframe_content)
+        ajaxm_match = re.findall(r"ajaxm\.php\?file=(\d+)", iframe_content)
+        
+        if not segment_match or not signs_match or not ajaxm_match:
+            raise Exception("解析页面参数失败")
+        
+        post_data = {
+            "action": "downprocess",
+            "websignkey": signs_match[0],
+            "signs": signs_match[0],
+            "sign": segment_match[0],
+            "websign": '',
+            "kd": 1,
+            "ves": 1
+        }
+        
+        # 使用原始域名构建ajax URL
+         ajax_url = f"https://{base_domain}/ajaxm.php?file={ajaxm_match[1] if len(ajaxm_match) > 1 else ajaxm_match[0]}"
+        response = await self.mlooc_curl_post(post_data, ajax_url, ifurl)
+        
+        return response
+    
+    async def _get_final_download_url(self, download_info):
+        """获取最终下载链接"""
+        # 解析返回的JSON
+        try:
+            result = json.loads(download_info)
+        except json.JSONDecodeError:
+            raise Exception("解析响应失败")
+        
+        if result.get('zt') != 1:
+            raise Exception(result.get('inf', '解析失败'))
+        
+        # 拼接下载链接
+        down_url1 = f"{result['dom']}/file/{result['url']}"
+        
+        # 解析最终直链地址
+        down_url2 = await self.mlooc_curl_head(
+            down_url1,
+            "https://developer.lanzoug.com",
+            self.default_user_agent
+        )
+        
+        # 确定最终下载链接
+        if "http" not in down_url2:
+            down_url = down_url1
+        else:
+            down_url = down_url2
+        
+        # 修复正则表达式，移除可能泄露服务器IP的pid参数
+        down_url = re.sub(r'pid=.*?&', '', down_url)
+        
+        return down_url
+    
     async def mlooc_curl_get(self, url: str, user_agent: str = None, retry_count: int = 3):
         """异步GET请求，支持重试"""
         if user_agent is None:
@@ -44,7 +214,7 @@ class LanzouCloudPlugin(Star):
         
         for attempt in range(retry_count):
             try:
-                async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=60) as client:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
                     response = await client.get(url, headers=headers)
                     if response.status_code == 200:
                         return response.text
@@ -77,14 +247,14 @@ class LanzouCloudPlugin(Star):
         if referer:
             headers['Referer'] = referer
         
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             try:
-                response = await client.post(url, data=post_data, headers=headers, timeout=30)
+                response = await client.post(url, data=post_data, headers=headers)
                 return response.text
             except Exception as e:
                 raise Exception(f"POST请求失败: {str(e)}")
 
-    async def mlooc_curl_head(self, url: str, referer: str, user_agent: str, cookie: str):
+    async def mlooc_curl_head(self, url: str, referer: str, user_agent: str):
         """获取重定向URL"""
         headers = {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
@@ -95,13 +265,12 @@ class LanzouCloudPlugin(Star):
             'Pragma': 'no-cache',
             'Upgrade-Insecure-Requests': '1',
             'User-Agent': user_agent,
-            'Referer': referer,
-            'Cookie': cookie
+            'Referer': referer
         }
         
-        async with httpx.AsyncClient(verify=False, follow_redirects=False) as client:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=10) as client:
             try:
-                response = await client.get(url, headers=headers, timeout=10)
+                response = await client.get(url, headers=headers)
                 if response.status_code in [301, 302, 303, 307, 308]:
                     return response.headers.get('Location', '')
                 return ''
@@ -113,17 +282,11 @@ class LanzouCloudPlugin(Star):
         if not url:
             raise Exception("请输入URL")
         
-        # 标准化链接格式，支持多种蓝奏云域名
+        # 标准化链接格式
         original_url = url
-        if '.com/' in url:
-            # 提取路径部分
+        if '.com/' in url and 'lanzou' not in url:
             path_part = url.split('.com/')[1]
-            # 使用原始域名，不强制转换为lanzoup.com
-            if 'lanzou' in url:
-                # 保持原域名
-                pass
-            else:
-                url = 'https://www.lanzoup.com/' + path_part
+            url = 'https://www.lanzoup.com/' + path_part
         
         # 获取页面内容
         soft_info = await self.mlooc_curl_get(url)
@@ -132,160 +295,22 @@ class LanzouCloudPlugin(Star):
         if "文件取消分享了" in soft_info:
             raise Exception("文件取消分享了")
         
-        # 提取文件名称和大小
-        soft_name = ["", ""]
-        soft_filesize = ["", ""]
+        # 提取文件信息
+        file_info = self._extract_file_info(soft_info)
         
-        # 尝试多种正则表达式匹配文件名
-        name_patterns = [
-            r'style="font-size: 30px;text-align: center;padding: 56px 0px 20px 0px;">(.*?)</div>',
-            r'<div class="n_box_3fn".*?>(.*?)</div>',
-            r'var filename = \'(.*?)\';',
-            r'div class="b"><span>(.*?)</span></div>'
-        ]
-        
-        for pattern in name_patterns:
-            match = re.search(pattern, soft_info)
-            if match:
-                soft_name[1] = match.group(1)
-                break
-        
-        # 尝试匹配文件大小
-        size_patterns = [
-            r'<div class="n_filesize".*?>大小：(.*?)</div>',
-            r'<span class="p7">文件大小：</span>(.*?)<br>'
-        ]
-        
-        for pattern in size_patterns:
-            match = re.search(pattern, soft_info)
-            if match:
-                soft_filesize[1] = match.group(1)
-                break
-        
-        # 处理带密码的链接
+        # 处理密码保护和公开链接
         if "function down_p(){" in soft_info:
-            if not pwd:
-                raise Exception("请输入分享密码")
-            
-            # 提取必要参数
-            segment_match = re.findall(r"'sign':'(.*?)',", soft_info)
-            signs_match = re.findall(r"ajaxdata = '(.*?)'", soft_info)
-            ajaxm_match = re.findall(r"ajaxm\.php\?file=(\d+)", soft_info)
-            
-            if not segment_match or not ajaxm_match:
-                raise Exception("解析页面参数失败")
-            
-            post_data = {
-                "action": "downprocess",
-                "sign": segment_match[1] if len(segment_match) > 1 else segment_match[0],
-                "p": pwd,
-                "kd": 1
-            }
-            
-            # 使用原始域名构建ajax URL
-            base_domain = url.split('/')[2] if '://' in url else 'www.lanzoup.com'
-            ajax_url = f"https://{base_domain}/ajaxm.php?file={ajaxm_match[0]}"
-            soft_info = await self.mlooc_curl_post(post_data, ajax_url, url)
-            
-            try:
-                result = json.loads(soft_info)
-                if 'inf' in result:
-                    soft_name[1] = result['inf']
-            except json.JSONDecodeError:
-                pass
+            download_info = await self._handle_password_protected_link(soft_info, url, pwd, file_info)
         else:
-            # 处理不带密码的链接
-            iframe_patterns = [
-                r'\n<iframe.*?name="[\s\S]*?"\ssrc="\/(.*?)"',
-                r'<iframe.*?name="[\s\S]*?"\ssrc="\/(.*?)"',
-                r'<iframe.*?src="\/(.*?)"',
-                r'<iframe[^>]*src="([^"]*?)"',
-                r'src="\/(fn\?[^"]*?)"',
-                r'src="([^"]*fn\?[^"]*?)"'
-            ]
-            
-            link_match = None
-            for pattern in iframe_patterns:
-                link_match = re.search(pattern, soft_info)
-                if link_match:
-                    break
-            
-            if not link_match:
-                # 如果是文件夹链接，尝试提取文件夹信息
-                if "文件夹" in soft_info or "folder" in url.lower() or "/b" in url:
-                    raise Exception("检测到文件夹链接，请提供具体文件的分享链接")
-                else:
-                    raise Exception("无法解析iframe链接，请检查链接是否正确")
-            
-            # 构建iframe URL，使用原始域名
-            iframe_path = link_match.group(1)
-            if iframe_path.startswith('http'):
-                ifurl = iframe_path
-            elif iframe_path.startswith('/'):
-                # 提取原始域名
-                base_domain = url.split('/')[2] if '://' in url else 'www.lanzoup.com'
-                ifurl = f"https://{base_domain}{iframe_path}"
-            else:
-                base_domain = url.split('/')[2] if '://' in url else 'www.lanzoup.com'
-                ifurl = f"https://{base_domain}/{iframe_path}"
-            soft_info = await self.mlooc_curl_get(ifurl)
-            
-            # 提取参数
-            segment_match = re.findall(r"wp_sign = '(.*?)'", soft_info)
-            signs_match = re.findall(r"ajaxdata = '(.*?)'", soft_info)
-            ajaxm_match = re.findall(r"ajaxm\.php\?file=(\d+)", soft_info)
-            
-            if not segment_match or not signs_match or not ajaxm_match:
-                raise Exception("解析页面参数失败")
-            
-            post_data = {
-                "action": "downprocess",
-                "websignkey": signs_match[0],
-                "signs": signs_match[0],
-                "sign": segment_match[0],
-                "websign": '',
-                "kd": 1,
-                "ves": 1
-            }
-            
-            # 使用原始域名构建ajax URL
-            base_domain = url.split('/')[2] if '://' in url else 'www.lanzoup.com'
-            ajax_url = f"https://{base_domain}/ajaxm.php?file={ajaxm_match[1] if len(ajaxm_match) > 1 else ajaxm_match[0]}"
-            soft_info = await self.mlooc_curl_post(post_data, ajax_url, ifurl)
+            download_info = await self._handle_public_link(soft_info, url, file_info)
         
-        # 解析返回的JSON
-        try:
-            result = json.loads(soft_info)
-        except json.JSONDecodeError:
-            raise Exception("解析响应失败")
-        
-        if result.get('zt') != 1:
-            raise Exception(result.get('inf', '解析失败'))
-        
-        # 拼接下载链接
-        down_url1 = f"{result['dom']}/file/{result['url']}"
-        
-        # 解析最终直链地址
-        down_url2 = await self.mlooc_curl_head(
-            down_url1,
-            "https://developer.lanzoug.com",
-            self.default_user_agent,
-            "down_ip=1; expires=Sat, 16-Nov-2019 11:42:54 GMT; path=/; domain=.baidupan.com"
-        )
-        
-        # 确定最终下载链接
-        if "http" not in down_url2:
-            down_url = down_url1
-        else:
-            down_url = down_url2
-        
-        # 移除可能泄露服务器IP的pid参数
-        down_url = re.sub(r'pid=(.*?.)&', '', down_url)
+        # 获取最终下载链接
+        final_url = await self._get_final_download_url(download_info)
         
         return {
-            "name": soft_name[1] if len(soft_name) > 1 and soft_name[1] else "未知文件",
-            "filesize": soft_filesize[1] if len(soft_filesize) > 1 and soft_filesize[1] else "未知大小",
-            "downUrl": down_url
+            "name": file_info.get('name', '未知文件'),
+            "filesize": file_info.get('size', '未知大小'),
+            "downUrl": final_url
         }
 
     @filter.command("lanzou")
