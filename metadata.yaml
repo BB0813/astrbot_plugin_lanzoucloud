@@ -1,5 +1,5 @@
-name: lanzoucloud # 这是你的插件的唯一识别名。
+name: astrbot_plugin_lanzoucloud # 这是你的插件的唯一识别名。
 desc: 蓝奏云文件解析插件，支持自动检测和手动解析蓝奏云分享链接 # 插件简短描述
 version: v1.0.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Binbim # 作者
-repo: https://github.com/Binbim/astrbot_plugin_lanzoucloud # 插件的仓库地址
+author: BB0813 # 作者
+repo: https://github.com/BB0813/astrbot_plugin_lanzoucloud # 插件的仓库地址
