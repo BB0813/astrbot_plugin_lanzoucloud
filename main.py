@@ -161,7 +161,7 @@ class LanzouCloudPlugin(Star):
         }
         
         # 使用原始域名构建ajax URL
-         ajax_url = f"https://{base_domain}/ajaxm.php?file={ajaxm_match[1] if len(ajaxm_match) > 1 else ajaxm_match[0]}"
+        ajax_url = f"https://{base_domain}/ajaxm.php?file={ajaxm_match[1] if len(ajaxm_match) > 1 else ajaxm_match[0]}"
         response = await self.mlooc_curl_post(post_data, ajax_url, ifurl)
         
         return response
